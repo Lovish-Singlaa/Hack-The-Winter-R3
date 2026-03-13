@@ -298,10 +298,10 @@ const Booking = () => {
           className={styles.cityDropdown}
         >
           <option value="" disabled>Select City</option>
-          <option value="Ahemdabad">Ahemdabad</option>
+          <option value="Ahmedabad">Ahmedabad</option>
           <option value="Delhi">Delhi</option>
           <option value="Mumbai">Mumbai</option>
-          <option value="Banglore">Banglore</option>
+          <option value="Bangalore">Bangalore</option>
         </select>
       </div>
 

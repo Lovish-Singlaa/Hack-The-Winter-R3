@@ -33,6 +33,15 @@ async function ensureTables() {
       )
     `);
 
+    // Try to add missing columns if Bookings table already exists from an older schema
+    try {
+      await client.query("ALTER TABLE Bookings ADD COLUMN IF NOT EXISTS seat_id VARCHAR(50) NOT NULL DEFAULT 'unknown'");
+      await client.query("ALTER TABLE Bookings ADD COLUMN IF NOT EXISTS section_id VARCHAR(50) NOT NULL DEFAULT 'unknown'");
+      await client.query("ALTER TABLE Bookings ADD COLUMN IF NOT EXISTS status VARCHAR(50) NOT NULL DEFAULT 'BOOKED'");
+    } catch (e) {
+      // Ignore if table doesn't exist yet
+    }
+
     // Bookings table
     await client.query(`
       CREATE TABLE IF NOT EXISTS Bookings (
