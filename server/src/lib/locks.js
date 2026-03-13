@@ -1,4 +1,4 @@
-import { redis, ensureConnection } from "./redis";
+import { redis, ensureConnection } from "./redis.js";
 import crypto from "crypto";
 
 // Key for permanent status in Redis
@@ -126,9 +126,10 @@ export async function isHeld(seatId) {
  */
 export async function setSeatBooked(seatId) {
   await ensureConnection();
-  // Set status to BOOKED. technically we don't need an expiry if we want it to be permanent until restart
-  // But maybe give it a long TTL just in case of weird state, though infinite is better for "authority"
-  await redis.set(`${STATUS_KEY_PREFIX}${seatId}`, "BOOKED");
+  // Set status to BOOKED with a 24-hour expiry (86400 seconds)
+  // This acts as a short-term authoritative cache that eventually expires,
+  // falling back to the true database state after 24 hours.
+  await redis.set(`${STATUS_KEY_PREFIX}${seatId}`, "BOOKED", "EX", 150);
 }
 
 /**

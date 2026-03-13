@@ -2,9 +2,9 @@
  * Background Worker
  * Consumes messages from Mock SQS and updates the database
  */
-import { mockSQS } from "./queue";
-import { createBooking, savePayment } from "./db";
-import { releaseHold } from "./locks";
+import { mockSQS } from "./queue.js";
+import { createBooking, savePayment } from "./db.js";
+import { releaseHold } from "./locks.js";
 
 const POLLING_INTERVAL = 1000; // Poll every 1 second
 

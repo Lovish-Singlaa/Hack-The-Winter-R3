@@ -1,89 +1,68 @@
-/**
- * AWS DynamoDB Client (Lambda Version - No/Min Dependencies)
- */
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, PutCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { Pool } from "pg";
 
-const dynamoClient = new DynamoDBClient({
-  region: process.env.AWS_REGION || "us-east-1"
-  // Credentials are automatically loaded from env (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+// Initialize Postgres connection pool
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : undefined,
 });
-
-const docClient = DynamoDBDocumentClient.from(dynamoClient, {
-  marshallOptions: { removeUndefinedValues: true }
-});
-
-const TABLES = {
-  SEATS: "Seats",
-  BOOKINGS: "Bookings",
-  PAYMENTS: "Payments"
-};
-
-// Note: No initDB or startWorker here purely because Lambda doesn't need to seed/poll
 
 export async function createBooking({ bookingId, seatId, sectionId, userId }) {
-  // Transaction: Update Seat status AND Create Booking
+  const client = await pool.connect();
   try {
-    await docClient.send(new TransactWriteCommand({
-      TransactItems: [
-        {
-          Update: {
-            TableName: TABLES.SEATS,
-            Key: { seat_id: seatId },
-            UpdateExpression: "SET #s = :booked",
-            ExpressionAttributeNames: { "#s": "status" },
-            ExpressionAttributeValues: { ":booked": "BOOKED" }
-          }
-        },
-        {
-          Put: {
-            TableName: TABLES.BOOKINGS,
-            Item: {
-              booking_id: bookingId,
-              seat_id: seatId,
-              section_id: sectionId,
-              user_id: userId,
-              status: "BOOKED",
-              created_at: new Date().toISOString()
-            }
-          }
-        }
-      ]
-    }));
+    await client.query("BEGIN");
+
+    // Update Seat status
+    await client.query(
+      "UPDATE Seats SET status = $1 WHERE seat_id = $2",
+      ["BOOKED", seatId]
+    );
+
+    // Create Booking
+    await client.query(
+      "INSERT INTO Bookings (booking_id, seat_id, section_id, user_id, status) VALUES ($1, $2, $3, $4, $5)",
+      [bookingId, seatId, sectionId, userId, "BOOKED"]
+    );
+
+    await client.query("COMMIT");
     return { bookingId, seatId, sectionId, userId, status: "BOOKED" };
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("Transaction failed:", err);
     throw err;
+  } finally {
+    client.release();
   }
 }
 
 export async function getPaymentByKey(idempotencyKey) {
-  const { Item } = await docClient.send(new GetCommand({
-    TableName: TABLES.PAYMENTS,
-    Key: { idempotency_key: idempotencyKey }
-  }));
-  return Item || null;
+  const { rows } = await pool.query(
+    "SELECT * FROM Payments WHERE idempotency_key = $1",
+    [idempotencyKey]
+  );
+  return rows[0] || null;
 }
 
 export async function savePayment({ bookingId, status, idempotencyKey }) {
+  const client = await pool.connect();
   try {
-    await docClient.send(new PutCommand({
-      TableName: TABLES.PAYMENTS,
-      Item: {
-        booking_id: bookingId,
-        status: status,
-        idempotency_key: idempotencyKey,
-        created_at: new Date().toISOString()
-      },
-      // Ensure idempotency: Fail if key exists (client handles conflict, or we return existing)
-      ConditionExpression: "attribute_not_exists(idempotency_key)"
-    }));
-    return { booking_id: bookingId, status, idempotency_key: idempotencyKey };
-  } catch (err) {
-    if (err.name === "ConditionalCheckFailedException") {
-      // Return existing
+    const { rows } = await client.query(
+      `INSERT INTO Payments (idempotency_key, booking_id, status) 
+       VALUES ($1, $2, $3) 
+       ON CONFLICT (idempotency_key) DO NOTHING 
+       RETURNING *`,
+      [idempotencyKey, bookingId, status]
+    );
+    
+    // If no rows were returned, the key already existed
+    if (rows.length === 0) {
       return await getPaymentByKey(idempotencyKey);
     }
+    
+    return rows[0];
+  } catch (err) {
+    console.error("Error saving payment:", err);
     throw err;
+  } finally {
+    client.release();
   }
 }

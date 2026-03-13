@@ -1,27 +1,12 @@
-/**
- * AWS DynamoDB Client
- */
-import { DynamoDBClient, CreateTableCommand, DescribeTableCommand, waitUntilTableExists } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, TransactWriteCommand, BatchWriteCommand } from "@aws-sdk/lib-dynamodb";
-import { startWorker } from "./worker";
+import { Pool } from "pg";
+import { startWorker } from "./worker.js";
 
-const dynamoClient = new DynamoDBClient({
-  region: process.env.AWS_REGION || "us-east-1",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  }
+// Initialize Postgres connection pool
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL,
+  // Always use SSL for remote databases (Neon, Vercel) even in local dev
+  ssl: process.env.POSTGRES_URL && process.env.POSTGRES_URL.includes("localhost") ? false : { rejectUnauthorized: false },
 });
-
-const docClient = DynamoDBDocumentClient.from(dynamoClient, {
-  marshallOptions: { removeUndefinedValues: true }
-});
-
-const TABLES = {
-  SEATS: "Seats",
-  BOOKINGS: "Bookings",
-  PAYMENTS: "Payments"
-};
 
 /**
  * Ensure tables exist and seed data
@@ -33,184 +18,163 @@ export async function initDB() {
   // Start the background worker (Singleton)
   startWorker();
   
-  console.log("✓ DynamoDB initialized");
+  console.log("✓ PostgreSQL initialized");
 }
 
 async function ensureTables() {
-  const tableDefinitions = [
-    {
-      TableName: TABLES.SEATS,
-      KeySchema: [{ AttributeName: "seat_id", KeyType: "HASH" }],
-      AttributeDefinitions: [{ AttributeName: "seat_id", AttributeType: "S" }]
-    },
-    {
-      TableName: TABLES.BOOKINGS,
-      KeySchema: [{ AttributeName: "booking_id", KeyType: "HASH" }],
-      AttributeDefinitions: [{ AttributeName: "booking_id", AttributeType: "S" }]
-    },
-    {
-      TableName: TABLES.PAYMENTS,
-      KeySchema: [{ AttributeName: "idempotency_key", KeyType: "HASH" }],
-      AttributeDefinitions: [{ AttributeName: "idempotency_key", AttributeType: "S" }]
-    }
-  ];
+  const client = await pool.connect();
+  try {
+    // Seats table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS Seats (
+        seat_id VARCHAR(50) PRIMARY KEY,
+        section_id VARCHAR(50) NOT NULL,
+        status VARCHAR(50) NOT NULL
+      )
+    `);
 
-  for (const def of tableDefinitions) {
-    try {
-      await dynamoClient.send(new DescribeTableCommand({ TableName: def.TableName }));
-    } catch (err) {
-      if (err.name === "ResourceNotFoundException") {
-        console.log(`Creating table ${def.TableName}...`);
-        await dynamoClient.send(new CreateTableCommand({
-          ...def,
-          BillingMode: "PAY_PER_REQUEST"
-        }));
-        await waitUntilTableExists({ client: dynamoClient, maxWaitTime: 60 }, { TableName: def.TableName });
-        console.log(`✓ Table ${def.TableName} created`);
-      } else {
-        throw err;
-      }
-    }
+    // Bookings table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS Bookings (
+        booking_id VARCHAR(255) PRIMARY KEY,
+        seat_id VARCHAR(50) NOT NULL,
+        section_id VARCHAR(50) NOT NULL,
+        user_id VARCHAR(255) NOT NULL,
+        status VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Payments table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS Payments (
+        idempotency_key VARCHAR(255) PRIMARY KEY,
+        booking_id VARCHAR(255) NOT NULL,
+        status VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    console.log("✓ PostgreSQL tables checked/created");
+  } catch (err) {
+    console.error("Error creating tables:", err);
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
 async function seedSeats() {
-  const { Count } = await docClient.send(new ScanCommand({ 
-    TableName: TABLES.SEATS, 
-    Select: "COUNT" 
-  }));
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query("SELECT COUNT(*) FROM Seats");
+    if (parseInt(rows[0].count) > 0) return;
 
-  if (Count > 0) return;
-
-  console.log("Seeding seats...");
-  const sections = { A: 24, B: 40, C: 60 };
-  const requests = [];
-
-  for (const [sectionId, count] of Object.entries(sections)) {
-    for (let i = 1; i <= count; i++) {
-      requests.push({
-        PutRequest: {
-          Item: {
-            seat_id: `${sectionId}${i}`,
-            section_id: sectionId,
-            status: "AVAILABLE"
-          }
-        }
-      });
-    }
-  }
-
-  // Batch write (max 25 items per request)
-  const chunks = [];
-  while (requests.length > 0) {
-    chunks.push(requests.splice(0, 25));
-  }
-
-  for (const chunk of chunks) {
-    await docClient.send(new BatchWriteCommand({
-      RequestItems: {
-        [TABLES.SEATS]: chunk
+    console.log("Seeding seats...");
+    const sections = { A: 24, B: 40, C: 60 };
+    
+    await client.query("BEGIN");
+    
+    for (const [sectionId, count] of Object.entries(sections)) {
+      for (let i = 1; i <= count; i++) {
+        await client.query(
+          "INSERT INTO Seats (seat_id, section_id, status) VALUES ($1, $2, $3) ON CONFLICT (seat_id) DO NOTHING",
+          [`${sectionId}${i}`, sectionId, "AVAILABLE"]
+        );
       }
-    }));
+    }
+    
+    await client.query("COMMIT");
+    console.log("✓ Seeded seats table");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Error seeding seats:", err);
+    throw err;
+  } finally {
+    client.release();
   }
-  
-  console.log("✓ Seeded seats table");
 }
 
 export async function getAllSeats() {
-  // Scan is okay for small dataset (~124 seats)
-  const { Items } = await docClient.send(new ScanCommand({ TableName: TABLES.SEATS }));
-  
-  // Sort to match SQL expectation (Section, then ID)
-  // Simple sort: A1, A2... B1...
-  return Items.sort((a, b) => {
-    if (a.section_id !== b.section_id) return a.section_id.localeCompare(b.section_id);
-    // numeric sort for seat number part if needed, but string sort is default in prev impl
-    // Actually typically A1, A10, A2. Let's mimic basic string sort of ID or try to be smart?
-    // SQL `ORDER BY section_id, seat_id` does string sort: A1, A10, A2...
-    return a.seat_id.localeCompare(b.seat_id);
-  });
+  const { rows } = await pool.query(
+    "SELECT * FROM Seats ORDER BY section_id, LENGTH(seat_id), seat_id"
+  );
+  return rows;
 }
 
 export async function getSeat(seatId) {
-  const { Item } = await docClient.send(new GetCommand({
-    TableName: TABLES.SEATS,
-    Key: { seat_id: seatId }
-  }));
-  return Item || null;
+  const { rows } = await pool.query(
+    "SELECT * FROM Seats WHERE seat_id = $1",
+    [seatId]
+  );
+  return rows[0] || null;
 }
 
 export async function createBooking({ bookingId, seatId, sectionId, userId }) {
-  // Transaction: Update Seat status AND Create Booking
+  const client = await pool.connect();
   try {
-    await docClient.send(new TransactWriteCommand({
-      TransactItems: [
-        {
-          Update: {
-            TableName: TABLES.SEATS,
-            Key: { seat_id: seatId },
-            UpdateExpression: "SET #s = :booked",
-            ExpressionAttributeNames: { "#s": "status" },
-            ExpressionAttributeValues: { ":booked": "BOOKED" }
-          }
-        },
-        {
-          Put: {
-            TableName: TABLES.BOOKINGS,
-            Item: {
-              booking_id: bookingId,
-              seat_id: seatId,
-              section_id: sectionId,
-              user_id: userId,
-              status: "BOOKED",
-              created_at: new Date().toISOString()
-            }
-          }
-        }
-      ]
-    }));
+    await client.query("BEGIN");
+
+    // Update Seat status
+    await client.query(
+      "UPDATE Seats SET status = $1 WHERE seat_id = $2",
+      ["BOOKED", seatId]
+    );
+
+    // Create Booking
+    await client.query(
+      "INSERT INTO Bookings (booking_id, seat_id, section_id, user_id, status) VALUES ($1, $2, $3, $4, $5)",
+      [bookingId, seatId, sectionId, userId, "BOOKED"]
+    );
+
+    await client.query("COMMIT");
     return { bookingId, seatId, sectionId, userId, status: "BOOKED" };
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("Transaction failed:", err);
     throw err;
+  } finally {
+    client.release();
   }
 }
 
 export async function getBooking(bookingId) {
-  const { Item } = await docClient.send(new GetCommand({
-    TableName: TABLES.BOOKINGS,
-    Key: { booking_id: bookingId }
-  }));
-  return Item || null;
+  const { rows } = await pool.query(
+    "SELECT * FROM Bookings WHERE booking_id = $1",
+    [bookingId]
+  );
+  return rows[0] || null;
 }
 
 export async function getPaymentByKey(idempotencyKey) {
-  const { Item } = await docClient.send(new GetCommand({
-    TableName: TABLES.PAYMENTS,
-    Key: { idempotency_key: idempotencyKey }
-  }));
-  return Item || null;
+  const { rows } = await pool.query(
+    "SELECT * FROM Payments WHERE idempotency_key = $1",
+    [idempotencyKey]
+  );
+  return rows[0] || null;
 }
 
 export async function savePayment({ bookingId, status, idempotencyKey }) {
+  const client = await pool.connect();
   try {
-    await docClient.send(new PutCommand({
-      TableName: TABLES.PAYMENTS,
-      Item: {
-        booking_id: bookingId,
-        status: status,
-        idempotency_key: idempotencyKey,
-        created_at: new Date().toISOString()
-      },
-      // Ensure idempotency: Fail if key exists (client handles conflict, or we return existing)
-      ConditionExpression: "attribute_not_exists(idempotency_key)"
-    }));
-    return { booking_id: bookingId, status, idempotency_key: idempotencyKey };
-  } catch (err) {
-    if (err.name === "ConditionalCheckFailedException") {
-      // Return existing
+    const { rows } = await client.query(
+      `INSERT INTO Payments (idempotency_key, booking_id, status) 
+       VALUES ($1, $2, $3) 
+       ON CONFLICT (idempotency_key) DO NOTHING 
+       RETURNING *`,
+      [idempotencyKey, bookingId, status]
+    );
+    
+    // If no rows were returned, the key already existed
+    if (rows.length === 0) {
       return await getPaymentByKey(idempotencyKey);
     }
+    
+    return rows[0];
+  } catch (err) {
+    console.error("Error saving payment:", err);
     throw err;
+  } finally {
+    client.release();
   }
 }
